@@ -39,6 +39,7 @@
 #include "py_metropolis_hop.hpp"
 #include "py_metropolis_local.hpp"
 #include "py_metropolis_local_pt.hpp"
+#include "py_dwave_xacc_sampler.hpp"
 
 namespace py = pybind11;
 
@@ -114,6 +115,7 @@ void AddSamplerModule(py::module &m) {
   AddExactSampler(subm);
   AddCustomSampler(subm);
   AddCustomSamplerPt(subm);
+  AddDwave(subm);
 }
 
 }  // namespace netket
