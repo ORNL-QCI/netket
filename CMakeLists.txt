@@ -193,7 +193,7 @@ if(NEKET_USE_LAPACK)
     target_link_libraries(netket_lib INTERFACE ${LAPACK_LIBRARIES})
 endif()
 
-
+find_package(XACC REQUIRED)
 set(NETKET_SOURCES
     Sources/pynetket.cc
     Sources/Dynamics/py_dynamics.cpp
@@ -226,7 +226,8 @@ set(NETKET_SOURCES
 )
 
 add_library(netket MODULE ${NETKET_SOURCES})
-target_link_libraries(netket PUBLIC netket_lib pybind11)
+target_include_directories(netket PUBLIC ${XACC_INCLUDE_DIRS})
+target_link_libraries(netket PUBLIC netket_lib pybind11 xacc xacc-quantum-aqc)
 set_target_properties(netket PROPERTIES PREFIX "${PYTHON_MODULE_PREFIX}"
                                         SUFFIX "${PYTHON_MODULE_EXTENSION}")
 add_dependencies(netket json_project eigen_project pybind11_project)
