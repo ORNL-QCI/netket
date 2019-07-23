@@ -237,7 +237,7 @@ set(NETKET_SOURCES
 
 add_library(netket MODULE ${NETKET_SOURCES})
 target_include_directories(netket PUBLIC ${XACC_INCLUDE_DIRS})
-target_link_libraries(netket PUBLIC netket_lib pybind11 xacc xacc-quantum-aqc)
+target_link_libraries(netket PUBLIC netket_lib pybind11 xacc xacc-quantum-aqc CppMicroServices)
 set_target_properties(netket PROPERTIES PREFIX "${PYTHON_MODULE_PREFIX}"
                                         SUFFIX "${PYTHON_MODULE_EXTENSION}")
 add_dependencies(netket json_project eigen_project pybind11_project)

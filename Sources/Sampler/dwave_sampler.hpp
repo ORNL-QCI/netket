@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef NETKET_DWAVE_XACC_SAMPLER_HPP
-#define NETKET_DWAVE_XACC_SAMPLER_HPP
+#ifndef NETKET_DWAVE_SAMPLER_HPP
+#define NETKET_DWAVE_SAMPLER_HPP
 
 #include <mpi.h>
 #include <Eigen/Dense>
@@ -23,15 +23,14 @@
 #include "Utils/random_utils.hpp"
 #include "abstract_sampler.hpp"
 
-#include "Embedding.hpp"
-#include "EmbeddingAlgorithm.hpp"
-#include "IRGenerator.hpp"
 #include "XACC.hpp"
 #include "xacc_service.hpp"
+#include "EmbeddingAlgorithm.hpp"
+#include "IRGenerator.hpp"
 
 namespace netket {
 
-// Metropolis sampling generating local moves in hilbert space
+// Exact sampling using heat bath, mostly for testing purposes on small systems
 class DWaveSampler : public AbstractSampler {
   // number of visible units
   const int nv_;
@@ -45,14 +44,14 @@ class DWaveSampler : public AbstractSampler {
   int mynode_;
   int totalnodes_;
 
-  // Look-up tables
-  typename AbstractMachine::LookupType lt_;
+  const HilbertIndex& hilbert_index_;
 
-  int nstates_;
-  std::vector<double> localstates_;
+  const int dim_;
 
-  int sweep_size_;
+  std::discrete_distribution<int> dist_;
 
+  std::vector<Complex> logpsivals_;
+  std::vector<double> psivals_;
  protected:
   std::shared_ptr<xacc::Function> amplitudeRbm;
   std::shared_ptr<xacc::Function> phaseRbm;
@@ -62,14 +61,15 @@ class DWaveSampler : public AbstractSampler {
 
  public:
   explicit DWaveSampler(AbstractMachine& psi)
-      : AbstractSampler(psi), nv_(GetHilbert().Size()) {
+      : AbstractSampler(psi),
+        nv_(GetHilbert().Size()),
+        hilbert_index_(GetHilbert().GetIndex()),
+        dim_(hilbert_index_.NStates()) {
     Init();
   }
 
   void Init() {
     v_.resize(nv_);
-
-    // Get the number of hidden units
     nh = dynamic_cast<RbmSpinPhase&>(GetMachine()).Nhidden();
 
     MPI_Comm_size(MPI_COMM_WORLD, &totalnodes_);
@@ -77,26 +77,14 @@ class DWaveSampler : public AbstractSampler {
 
     if (!GetHilbert().IsDiscrete()) {
       throw InvalidInputError(
-          "Dwave sampler works only for discrete "
+          "DWave sampler works only for discrete "
           "Hilbert spaces");
     }
 
     accept_.resize(1);
     moves_.resize(1);
 
-    nstates_ = GetHilbert().LocalSize();
-    localstates_ = GetHilbert().LocalStates();
-
-    Reset(true);
-
-    // Always use odd sweep size to avoid possible ergodicity problems
-    if (nv_ % 2 == 0) {
-      sweep_size_ = nv_ + 1;
-    } else {
-      sweep_size_ = nv_;
-    }
-
-    // Get the D-Wave QPU
+ // Get the D-Wave QPU
     dwave = xacc::getAccelerator("dwave");
 
     // Create the RBM IR Generator
@@ -128,12 +116,6 @@ class DWaveSampler : public AbstractSampler {
     for (auto& edge : hardwareconnections) {
       hardware->addEdge(edge.first, edge.second);
     }
-    //----
-
-    // Get just one of the RBM graphs
-    // std::cout << "HELLO:\n";
-    // auto amplitudeGraph = amplitudeRbm->toGraph();
-    // std::cout << "HOWDY\n";
 
     int maxBitIdx = 0;
     for (auto inst : amplitudeRbm->getInstructions()) {
@@ -169,7 +151,8 @@ class DWaveSampler : public AbstractSampler {
     auto a = xacc::getService<xacc::quantum::EmbeddingAlgorithm>("cmr");
     embedding = a->embed(problemGraph, hardware);
 
-    // Create 2 D-Wave Function that
+    Reset(true);
+
     InfoMessage() << "DWave sampler is ready " << std::endl;
   }
 
@@ -178,13 +161,17 @@ class DWaveSampler : public AbstractSampler {
       GetHilbert().RandomVals(v_, this->GetRandomEngine());
     }
 
-    GetMachine().InitLookup(v_, lt_);
+    double logmax = -std::numeric_limits<double>::infinity();
 
-    accept_ = Eigen::VectorXd::Zero(1);
-    moves_ = Eigen::VectorXd::Zero(1);
-  }
+    logpsivals_.resize(dim_);
+    psivals_.resize(dim_);
 
-  void Sweep() override {
+    for (int i = 0; i < dim_; ++i) {
+      auto v = hilbert_index_.NumberToState(i);
+      logpsivals_[i] = GetMachine().LogVal(v);
+      logmax = std::max(logmax, std::real(logpsivals_[i]));
+    }
+
     auto qbits1 = xacc::qalloc(2000);
     auto qbits2 = xacc::qalloc(2000);
 
@@ -223,76 +210,29 @@ class DWaveSampler : public AbstractSampler {
     // * Unembed the counts...
     // * Map counts to what they need for sampling
     qbits1->print();
-    exit(0);
 
-    // My thought is to re-use the Metropolis Local stuff
-    // and use all the bit strings from D-Wave
-    std::vector<int> tochange(1);
-    std::vector<double> newconf(1);
-
-    std::uniform_real_distribution<double> distu;
-    std::uniform_int_distribution<int> distrs(0, nv_ - 1);
-    std::uniform_int_distribution<int> diststate(0, nstates_ - 1);
-
-    for (int i = 0; i < sweep_size_; i++) {
-      // picking a random site to be changed
-      int si = distrs(this->GetRandomEngine());
-      assert(si < nv_);
-      tochange[0] = si;
-
-      // picking a random state
-      int newstate = diststate(this->GetRandomEngine());
-      newconf[0] = localstates_[newstate];
-
-      // make sure that the new state is not equal to the current one
-      while (std::abs(newconf[0] - v_(si)) <
-             std::numeric_limits<double>::epsilon()) {
-        newstate = diststate(this->GetRandomEngine());
-        newconf[0] = localstates_[newstate];
-      }
-
-      const auto lvd = GetMachine().LogValDiff(v_, tochange, newconf, lt_);
-      double ratio = this->GetMachineFunc()(std::exp(lvd));
-
-#ifndef NDEBUG
-      const auto psival1 = GetMachine().LogVal(v_);
-      if (std::abs(
-              std::exp(GetMachine().LogVal(v_) - GetMachine().LogVal(v_, lt_)) -
-              1.) > 1.0e-8) {
-        std::cerr << GetMachine().LogVal(v_) << "  and LogVal with Lt is "
-                  << GetMachine().LogVal(v_, lt_) << std::endl;
-        std::abort();
-      }
-#endif
-
-      // Metropolis acceptance test
-      if (ratio > distu(this->GetRandomEngine())) {
-        accept_[0] += 1;
-        GetMachine().UpdateLookup(v_, tochange, newconf, lt_);
-        GetHilbert().UpdateConf(v_, tochange, newconf);
-
-#ifndef NDEBUG
-        const auto psival2 = GetMachine().LogVal(v_);
-        if (std::abs(std::exp(psival2 - psival1 - lvd) - 1.) > 1.0e-8) {
-          std::cerr << psival2 - psival1 << " and logvaldiff is " << lvd
-                    << std::endl;
-          std::cerr << psival2 << " and LogVal with Lt is "
-                    << GetMachine().LogVal(v_, lt_) << std::endl;
-          std::abort();
-        }
-#endif
-      }
-      moves_[0] += 1;
+    // FIXME psivals_ from counts distribution...
+    for (int i = 0; i < dim_; ++i) {
+      psivals_[i] = this->GetMachineFunc()(std::exp(logpsivals_[i] - logmax));
     }
+
+    dist_ = std::discrete_distribution<int>(psivals_.begin(), psivals_.end());
+
+    accept_ = Eigen::VectorXd::Zero(1);
+    moves_ = Eigen::VectorXd::Zero(1);
+  }
+
+  void Sweep() override {
+    int newstate = dist_(this->GetRandomEngine());
+    v_ = hilbert_index_.NumberToState(newstate);
+
+    accept_(0) += 1;
+    moves_(0) += 1;
   }
 
   const Eigen::VectorXd& Visible() const noexcept override { return v_; }
 
   void SetVisible(const Eigen::VectorXd& v) override { v_ = v; }
-
-  AbstractMachine::VectorType DerLogVisible() override {
-    return GetMachine().DerLog(v_, lt_);
-  }
 
   Eigen::VectorXd Acceptance() const override {
     Eigen::VectorXd acc = accept_;
@@ -300,6 +240,11 @@ class DWaveSampler : public AbstractSampler {
       acc(i) /= moves_(i);
     }
     return acc;
+  }
+
+  void SetMachineFunc(MachineFunction machine_func) override {
+    AbstractSampler::SetMachineFunc(machine_func);
+    Reset(true);
   }
 };
 

@@ -16,13 +16,13 @@
 #define NETKET_PY_DWAVE_HPP
 
 #include <pybind11/pybind11.h>
-#include "dwave_xacc_sampler.hpp"
+#include "dwave_sampler.hpp"
 
 namespace py = pybind11;
 
 namespace netket {
 
-void AddDwave(py::module &subm) {
+void AddDwaveSampler(py::module &subm) {
   py::class_<DWaveSampler, AbstractSampler>(subm, "DWaveSampler", "")
       .def(py::init<AbstractMachine &>(), py::keep_alive<1, 2>(),
            py::arg("machine"), "");
