@@ -23,10 +23,10 @@
 #include "Utils/random_utils.hpp"
 #include "abstract_sampler.hpp"
 
-#include "XACC.hpp"
-#include "xacc_service.hpp"
 #include "EmbeddingAlgorithm.hpp"
 #include "IRGenerator.hpp"
+#include "XACC.hpp"
+#include "xacc_service.hpp"
 
 namespace netket {
 
@@ -52,9 +52,9 @@ class DWaveSampler : public AbstractSampler {
 
   std::vector<Complex> logpsivals_;
   std::vector<double> psivals_;
+
  protected:
-  std::shared_ptr<xacc::Function> amplitudeRbm;
-  std::shared_ptr<xacc::Function> phaseRbm;
+  std::shared_ptr<xacc::Function> _rbm;
   std::shared_ptr<xacc::Accelerator> dwave;
   xacc::quantum::Embedding embedding;
   int nh = 0;
@@ -70,7 +70,12 @@ class DWaveSampler : public AbstractSampler {
 
   void Init() {
     v_.resize(nv_);
-    nh = dynamic_cast<RbmSpinPhase&>(GetMachine()).Nhidden();
+    try {
+      nh = dynamic_cast<RbmSpinPhase&>(GetMachine()).Nhidden();
+    } catch (const std::bad_cast& e) {
+      // Cast failed, try real
+      nh = dynamic_cast<RbmSpin&>(GetMachine()).Nhidden();
+    }
 
     MPI_Comm_size(MPI_COMM_WORLD, &totalnodes_);
     MPI_Comm_rank(MPI_COMM_WORLD, &mynode_);
@@ -84,16 +89,14 @@ class DWaveSampler : public AbstractSampler {
     accept_.resize(1);
     moves_.resize(1);
 
- // Get the D-Wave QPU
+    // Get the D-Wave QPU
     dwave = xacc::getAccelerator("dwave");
 
     // Create the RBM IR Generator
     auto rbmGenerator = xacc::getService<xacc::IRGenerator>("rbm");
 
     // Create RBMs for Amplitude and Phase
-    amplitudeRbm =
-        rbmGenerator->generate({{"visible-units", nv_}, {"hidden-units", nh}});
-    phaseRbm =
+    _rbm =
         rbmGenerator->generate({{"visible-units", nv_}, {"hidden-units", nh}});
 
     /// ---
@@ -118,7 +121,7 @@ class DWaveSampler : public AbstractSampler {
     }
 
     int maxBitIdx = 0;
-    for (auto inst : amplitudeRbm->getInstructions()) {
+    for (auto inst : _rbm->getInstructions()) {
       if (inst->name() == "dw-qmi") {
         auto qbit1 = inst->bits()[0];
         auto qbit2 = inst->bits()[1];
@@ -137,7 +140,7 @@ class DWaveSampler : public AbstractSampler {
       problemGraph->addVertex(m);
     }
 
-    for (auto inst : amplitudeRbm->getInstructions()) {
+    for (auto inst : _rbm->getInstructions()) {
       if (inst->name() == "dw-qmi") {
         auto qbit1 = inst->bits()[0];
         auto qbit2 = inst->bits()[1];
@@ -151,7 +154,7 @@ class DWaveSampler : public AbstractSampler {
     auto a = xacc::getService<xacc::quantum::EmbeddingAlgorithm>("cmr");
     embedding = a->embed(problemGraph, hardware);
 
-    Reset(true);
+    // Reset(true);
 
     InfoMessage() << "DWave sampler is ready " << std::endl;
   }
@@ -161,59 +164,71 @@ class DWaveSampler : public AbstractSampler {
       GetHilbert().RandomVals(v_, this->GetRandomEngine());
     }
 
-    double logmax = -std::numeric_limits<double>::infinity();
-
-    logpsivals_.resize(dim_);
     psivals_.resize(dim_);
+    //   auto v = hilbert_index_.NumberToState(4);
+    //   std::cout << nh << ", HELLO: \n" << v << "\n";
 
-    for (int i = 0; i < dim_; ++i) {
-      auto v = hilbert_index_.NumberToState(i);
-      logpsivals_[i] = GetMachine().LogVal(v);
-      logmax = std::max(logmax, std::real(logpsivals_[i]));
-    }
-
+    // auto vv = (Eigen::VectorXd::Ones(4) + v ) / 2;
+    // std::cout << "HOWDY:\n" << vv << "\n";
+    // exit(0);
     auto qbits1 = xacc::qalloc(2000);
-    auto qbits2 = xacc::qalloc(2000);
 
     qbits1->addExtraInfo("embedding", embedding);
-    qbits2->addExtraInfo("embedding", embedding);
 
     auto params = GetMachine().GetParameters();
     auto half = params.size() / 2;
-    Eigen::VectorXcd rbm1(half), rbm2(half);
+    Eigen::VectorXcd rbm1(half);
 
     // this is [visible | hidden | weights || visible | hidden | weights]
     rbm1.segment(0, nv_) = params.segment(0, nv_);
-    rbm2.segment(0, nv_) = params.segment(half, nv_);
     rbm1.segment(nv_, nh) = params.segment(nv_, nh);
-    rbm2.segment(nv_, nh) = params.segment(half + nv_, nh);
 
     const int initw = nv_ + nh;
 
     rbm1.segment(initw, nv_ * nh) = params.segment(initw, nv_ * nh);
-    rbm2.segment(initw, nv_ * nh) = params.segment(half + initw, nv_ * nh);
 
     auto rbm1_tmp = rbm1.real();
-    auto rbm2_tmp = rbm2.real();
     std::vector<double> rbm1vec(rbm1_tmp.data(),
                                 rbm1_tmp.data() + rbm1_tmp.size());
-    std::vector<double> rbm2vec(rbm2_tmp.data(),
-                                rbm2_tmp.data() + rbm2_tmp.size());
 
-    auto amp_tmp = amplitudeRbm->operator()(rbm1vec);
-    auto phase_tmp = phaseRbm->operator()(rbm1vec);
+    auto amp_tmp = _rbm->operator()(rbm1vec);
 
     dwave->execute(qbits1, amp_tmp);
-    dwave->execute(qbits2, phase_tmp);
 
     // Task for Sindhu
     // * Unembed the counts...
     // * Map counts to what they need for sampling
-    qbits1->print();
+    // qbits1->print();
+    auto results = qbits1->getMeasurementCounts();
+    std::map<std::string, double> visibleCounts;
+    double totalCounts = 0;
+    for (auto& kv : results) {
+        totalCounts += kv.second;
+        auto vis = kv.first.substr(0, nv_);
+        if (visibleCounts.count(vis)) {
+            visibleCounts[vis] += kv.second;
+        } else {
+            visibleCounts.insert({vis, kv.second});
+        }
+    }
+    // exit(0);
 
+    // for (auto & kv : visibleCounts) {
+    //     std::cout << "VIS: " << kv.first << ", " << kv.second << "\n";
+    // }
     // FIXME psivals_ from counts distribution...
     for (int i = 0; i < dim_; ++i) {
-      psivals_[i] = this->GetMachineFunc()(std::exp(logpsivals_[i] - logmax));
+      auto v = hilbert_index_.NumberToState(i);
+      auto vv = (Eigen::VectorXi::Ones(nv_) + v.cast<int>() ) / 2;
+
+      std::string bitStr = "";
+      for (int j = 0; j < nv_; j++) bitStr += std::to_string(vv(j));
+
+      if (visibleCounts.count(bitStr)) {
+        psivals_[i] = visibleCounts[bitStr] / totalCounts;
+      } else {
+        psivals_[i] = 0.0;
+      }
     }
 
     dist_ = std::discrete_distribution<int>(psivals_.begin(), psivals_.end());
